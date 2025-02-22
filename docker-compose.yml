@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  homepage-monitor:
+    build: .
+    container_name: homepage-monitor
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /volume1/docker/Homepage/config:/config
+    restart: always
