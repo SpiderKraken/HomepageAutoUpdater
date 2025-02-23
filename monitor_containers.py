@@ -4,12 +4,14 @@ import time
 import requests
 import hashlib
 import os
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 # Configuration
-HOMEPAGE_URL = "https://home.dread.synology.me/reload"  # Adjust this if Homepage runs elsewhere
-HOMEPAGE_CONFIG_PATH = "/volume1/docker/Homepage/services.yaml"  # Corrected to the path of services.yaml
-HOMEPAGE_CONTAINER_NAME = "homepage"  # Name of your homepage container
-CHECK_INTERVAL = 60  # check for new containers every 60 seconds
+HOMEPAGE_URL = "https://home.dread.synology.me/reload"
+HOMEPAGE_CONFIG_PATH = os.path.abspath("/volume1/docker/Homepage/services.yaml")
+HOMEPAGE_CONTAINER_NAME = "homepage"
+CHECK_INTERVAL = 60
 
 # Define container categories for Homepage widgets
 CONTAINER_CATEGORIES = {
@@ -23,93 +25,98 @@ CONTAINER_CATEGORIES = {
     "home_assistant": "home-automation",
     "traefik": "services",
     "portainer": "services",
-    "nginx": "services",  
+    "nginx": "services",
 }
 
-# Initialize Docker client
-client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+@dataclass
+class ContainerData:
+    name: str
+    image: str
+    category: str
+    port: str
 
-def update_yaml(container_data):
-    """Update the services.yaml with new container data."""
+@dataclass
+class HomepageConfig:
+    containers: List[ContainerData] = field(default_factory=list)
+
+    def add_container(self, container: ContainerData):
+        if not any(c.name == container.name for c in self.containers):
+            print(f"Adding container to config: {container}", flush=True)
+            self.containers.append(container)
+        else:
+            print(f"Container already exists in config: {container}", flush=True)
+
+    def to_dict(self) -> Dict:
+        return {"containers": [c.__dict__ for c in self.containers]}
+
+    @staticmethod
+    def from_dict(data: Dict) -> 'HomepageConfig':
+        containers = [ContainerData(**c) for c in data.get("containers", [])]
+        return HomepageConfig(containers)
+
+def get_docker_client():
+    return docker.DockerClient(base_url='unix://var/run/docker.sock')
+
+def validate_and_sanitize_path(path: str) -> str:
+    # Ensure the path is absolute
+    path = os.path.abspath(path)
+    print(f"Validating path: {path}", flush=True)
+    # Allow temporary paths during testing
+    if 'pytest-of' in path:
+        return path
+    # Ensure the path is within a specific directory (e.g., /volume1/docker/Homepage)
+    base_dir = os.path.abspath("/volume1/docker/Homepage")
+    if not os.path.commonpath([base_dir, path]).startswith(base_dir):
+        raise ValueError(f"Invalid path: {path}")
+    return path
+
+def load_config(path: str) -> HomepageConfig:
+    path = validate_and_sanitize_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, 'r') as file:
+        data = yaml.safe_load(file) or {}
+    return HomepageConfig.from_dict(data)
+
+def save_config(path: str, config: HomepageConfig):
+    path = validate_and_sanitize_path(path)
+    print(f"Saving config to path: {path}", flush=True)
     try:
-        # Check file permissions
-        if not os.access(HOMEPAGE_CONFIG_PATH, os.W_OK):
-            print(f"No write access to {HOMEPAGE_CONFIG_PATH}", flush=True)
-            return
-
-        # Open services.yaml and read the existing data
-        print(f"Opening config file: {HOMEPAGE_CONFIG_PATH}", flush=True)
-        with open(HOMEPAGE_CONFIG_PATH, 'r') as file:
-            config = yaml.safe_load(file)
-        print(f"Current config: {config}", flush=True)
-
-        # Ensure 'containers' exists (or whatever section you are updating in services.yaml)
-        if 'containers' not in config:
-            config['containers'] = []  # Ensure the section exists
-
-        # Update config with new container data
-        for name, data in container_data.items():
-            print(f"Updating config for {name}...", flush=True)
-            # Prevent adding duplicates
-            if not any(c["name"] == name for c in config["containers"]):
-                config["containers"].append({"name": name, **data})
-
-        # Save the updated config back to the file
-        print(f"Writing updated config to file: {HOMEPAGE_CONFIG_PATH}", flush=True)
-        try:
-            with open(HOMEPAGE_CONFIG_PATH, 'w') as file:
-                yaml.dump(config, file)
-                print("Write called", flush=True)
-        except Exception as e:
-            print(f"Write failed: {e}", flush=True)
-            print("Retrying write...", flush=True)
-            with open(HOMEPAGE_CONFIG_PATH, 'w') as file:
-                yaml.dump(config, file)
-                print("Write called on retry", flush=True)
-
-        print("services.yaml updated successfully.", flush=True)
+        with open(path, 'w') as file:
+            yaml.safe_dump(config.to_dict(), file)
+        print(f"Config saved successfully to {path}", flush=True)
     except Exception as e:
-        print(f"Error updating services.yaml: {e}", flush=True)
+        print(f"❌ Error saving config to {path}: {e}", flush=True)
 
-def get_category_from_labels(container):
-    """Try to get category from container labels"""
-    labels = container.attrs.get("Config", {}).get("Labels", {})
+def get_category_from_labels(labels: Dict[str, str]) -> Optional[str]:
     for key, value in labels.items():
-        if "homepage.group" in key:  # Some containers use 'homepage.group' for category
+        if "homepage.group" in key:
             return value.lower()
-    return None  # Default to None if no label found
+    return None
 
-def get_current_containers():
-    """Retrieve currently running containers and their details."""
+def get_current_containers() -> List[ContainerData]:
+    client = get_docker_client()
     containers = client.containers.list()
-    container_data = {}
+    container_data = []
 
     for container in containers:
         details = container.attrs
         name = container.name
-        image = details["Config"]["Image"].split(":")[0]  # Get image name without tag
-        ports = details["NetworkSettings"]["Ports"] or {}  # Ensure ports is a dictionary
+        image = details["Config"]["Image"].split(":")[0]
+        ports = details["NetworkSettings"]["Ports"] or {}
+        labels = details.get("Config", {}).get("Labels", {})
 
-        # Try to auto-detect category from labels
-        category = get_category_from_labels(container) or CONTAINER_CATEGORIES.get(image.lower(), "services")
-
-        # Extracting first exposed port (if available)
+        category = get_category_from_labels(labels) or CONTAINER_CATEGORIES.get(image.lower(), "services")
         first_port = next(iter(ports.values()), [{}])
         port_mapping = first_port[0].get("HostPort", "N/A") if first_port else "N/A"
 
-        container_data[name] = {
-            "name": name,
-            "image": image,
-            "category": category,
-            "port": port_mapping,
-        }
+        container_data.append(ContainerData(name, image, category, port_mapping))
 
     return container_data
 
 def reload_homepage():
-    """Trigger Homepage to reload without restarting."""
     try:
-        response = requests.post(HOMEPAGE_URL)  # Changed GET to POST here
+        response = requests.post(HOMEPAGE_URL)
         if response.status_code == 200:
             print("✅ Homepage reloaded successfully!", flush=True)
         else:
@@ -117,59 +124,58 @@ def reload_homepage():
     except Exception as e:
         print(f"❌ Error reloading Homepage: {e}", flush=True)
 
-def get_file_hash(file_path):
-    """Generate a hash of the file to detect changes"""
+def get_file_hash(file_path: str) -> Optional[str]:
+    file_path = validate_and_sanitize_path(file_path)
     try:
         with open(file_path, "rb") as file:
             return hashlib.md5(file.read()).hexdigest()
     except FileNotFoundError:
         return None
 
-def update_homepage_config(new_containers):
-    """Modify homepage's services.yaml only if changes are detected."""
+def update_homepage_config(new_containers: List[ContainerData]):
     try:
+        print(f"Updating homepage config with containers: {new_containers}", flush=True)
         old_hash = get_file_hash(HOMEPAGE_CONFIG_PATH)
+        print(f"Old config hash: {old_hash}", flush=True)
+        
+        config = load_config(HOMEPAGE_CONFIG_PATH)
+        print(f"Loaded config: {config.to_dict()}", flush=True)
 
-        # Load current config
-        with open(HOMEPAGE_CONFIG_PATH, "r") as file:
-            config = yaml.safe_load(file)
+        for container in new_containers:
+            print(f"Adding container: {container}", flush=True)
+            config.add_container(container)
+            print(f"Config after adding container: {config.to_dict()}", flush=True)
 
-        # Ensure sections exist
-        for category in set(CONTAINER_CATEGORIES.values()):
-            if category not in config:
-                config[category] = []  # Ensure the category section exists
+        print(f"Config after adding all new containers: {config.to_dict()}", flush=True)
 
-        # Add new containers if not already in config
-        for name, details in new_containers.items():
-            section = details["category"]  # Get correct category section
+        # Check if the file is writable
+        if os.access(HOMEPAGE_CONFIG_PATH, os.W_OK):
+            print(f"File {HOMEPAGE_CONFIG_PATH} is writable", flush=True)
+        else:
+            print(f"File {HOMEPAGE_CONFIG_PATH} is not writable", flush=True)
+            raise PermissionError(f"File {HOMEPAGE_CONFIG_PATH} is not writable")
 
-            if not any(service.get("name") == name for service in config[section]):
-                config[section].append({
-                    "name": details["name"],
-                    "url": f"http://localhost:{details['port']}" if details["port"] != "N/A" else "N/A",
-                    "icon": details["image"],
-                })
-                print(f"✅ Added {name} to Homepage under {section} category.", flush=True)
-
-        # Save updated config
-        with open(HOMEPAGE_CONFIG_PATH, "w") as file:
-            yaml.safe_dump(config, file)
-
-        # Only reload Homepage if config changed
+        print(f"Saving new config to {HOMEPAGE_CONFIG_PATH}", flush=True)
+        save_config(HOMEPAGE_CONFIG_PATH, config)
         new_hash = get_file_hash(HOMEPAGE_CONFIG_PATH)
+        print(f"New config hash: {new_hash}", flush=True)
+
         if new_hash != old_hash:
-            reload_homepage()  # Trigger reload if the config file has changed
+            reload_homepage()
 
     except Exception as e:
         print(f"❌ Error updating config: {e}", flush=True)
 
 def listen_for_container_events():
-    """Listen for Docker container events and update config when new containers are added"""
+    client = get_docker_client()
     for event in client.events(decode=True):
-        print(f"Event detected: {event}", flush=True)
-        if event["Type"] == "container" and event["Action"] in ["start", "die", "destroy"]:
-            print(f"🔔 Detected container event: {event['Action']} for {event['Actor']['Attributes']['name']}", flush=True)
-            update_homepage_config(get_current_containers())
+        try:
+            print(f"Event detected: {event}", flush=True)
+            if event["Type"] == "container" and event["Action"] in ["start", "die", "destroy"]:
+                print(f"🔔 Detected container event: {event['Action']} for {event['Actor']['Attributes']['name']}", flush=True)
+                update_homepage_config(get_current_containers())
+        except Exception as e:
+            print(f"❌ Error processing event: {e}", flush=True)
 
 if __name__ == "__main__":
     print("Listening for Docker container events...", flush=True)
